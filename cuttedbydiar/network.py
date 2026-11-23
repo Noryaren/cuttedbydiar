@@ -52,27 +52,18 @@ def _local_iface() -> tuple[str, str]:
 
 
 def _iface_network(iface_name: str) -> ipaddress.IPv4Network:
-    """Best-effort subnet of the given interface, respecting netmask (e.g. /21, /24)."""
-    try:
-        import re
-        if IS_WINDOWS:
-            # Fallback for Windows
-            pass
-        else:
-            out = subprocess.check_output(["ip", "addr", "show", iface_name], text=True)
-            m = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+/\d+)', out)
-            if m:
-                return ipaddress.IPv4Network(m.group(1), strict=False)
-    except Exception:
-        pass
+    """Return the /24 subnet where the host resides.
 
-    # fallback to scapy or /24
+    Scanning a full /24 (256 IPs) is extremely reliable and prevents packet loss
+    on Wi-Fi, which often occurs when attempting to scan massive /21 networks (2048 IPs).
+    """
     from scapy.all import conf
     try:
         iface = conf.ifaces.dev_from_name(iface_name)
         addr = iface.ip
         return ipaddress.IPv4Network(f"{addr}/24", strict=False)
     except Exception:
+        # fallback: derive from connected socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(("8.8.8.8", 80))
