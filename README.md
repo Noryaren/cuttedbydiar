@@ -43,24 +43,18 @@ Karena aplikasi ini berinteraksi langsung dengan lalu lintas jaringan (mengirim 
   dist\cuttedbydiar-gui.exe
   ```
 
-### 🐧 Di Linux
-1. Instal dependensi dasar:
-   ```bash
-   sudo apt update
-   sudo apt install python3-pip python3-full
-   ```
-2. Instal pustaka Python:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Jalankan GUI dengan hak akses root:
-   ```bash
-   sudo python3 run.py gui
-   ```
-   Atau CLI:
-   ```bash
-   sudo python3 run.py scan
-   ```
+### 🐧 Di Linux (Termasuk Linux Mint, Ubuntu, Debian, dll.)
+1. Cukup jalankan perintah berikut di terminal (script otomatis mengurus venv dan dependensi):
+   * **Menjalankan GUI (Tampilan Jendela):**
+     ```bash
+     sudo ./run.sh gui
+     ```
+   * **Menjalankan Scan Jaringan (CLI):**
+     ```bash
+     sudo ./run.sh scan
+     ```
+
+*(Catatan: Jika ada masalah dengan pustaka grafis, instal terlebih dahulu via `sudo apt install python3-tk`).*
 
 ---
 
