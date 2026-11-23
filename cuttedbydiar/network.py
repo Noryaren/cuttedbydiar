@@ -52,18 +52,13 @@ def _local_iface() -> tuple[str, str]:
 
 
 def _iface_network(iface_name: str) -> ipaddress.IPv4Network:
-    """Return the /24 subnet where the host resides.
-
-    Scanning a full /24 (256 IPs) is extremely reliable and prevents packet loss
-    on Wi-Fi, which often occurs when attempting to scan massive /21 networks (2048 IPs).
-    """
+    """Return the /24 subnet where the host resides."""
     from scapy.all import conf
     try:
         iface = conf.ifaces.dev_from_name(iface_name)
         addr = iface.ip
         return ipaddress.IPv4Network(f"{addr}/24", strict=False)
     except Exception:
-        # fallback: derive from connected socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(("8.8.8.8", 80))
@@ -162,19 +157,35 @@ def scan_devices(
     timeout: float = 3.0,
     resolve_names: bool = True,
 ) -> list[Device]:
-    """ARP-scan the local subnet and merge with system ARP cache."""
+    """ARP-scan the local subnet and merge with system ARP cache & local host."""
     _lazy_scapy()
     from scapy.all import ARP, Ether, srp
 
     if iface_name is None:
-        iface_name, _ = _local_iface()
+        iface_name, own_mac = _local_iface()
+    else:
+        from scapy.all import get_if_hwaddr
+        own_mac = get_if_hwaddr(iface_name)
 
     devices: dict[str, Device] = {}
 
-    # 1. Harvest system ARP cache first (instant, gets all known active devices)
+    # 0. Add own computer explicitly
+    own_ip = ""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        own_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        pass
+
+    if own_ip and own_mac:
+        devices[own_ip] = Device(ip=own_ip, mac=normalize_mac(own_mac), hostname="[This Computer]")
+
+    # 1. Harvest system ARP cache
     for ip, mac in _get_system_arp_cache():
         try:
-            if ipaddress.ip_address(ip).is_private:
+            if ipaddress.ip_address(ip).is_private and ip not in devices:
                 devices[ip] = Device(ip=ip, mac=normalize_mac(mac))
         except Exception:
             pass
@@ -191,13 +202,16 @@ def scan_devices(
         for _, rcv in ans:
             ip = rcv.psrc
             mac = normalize_mac(rcv.hwsrc)
-            devices[ip] = Device(ip=ip, mac=mac)
+            if ip not in devices:
+                devices[ip] = Device(ip=ip, mac=mac)
     except Exception:
         pass
 
     if resolve_names:
         for dev in devices.values():
-            if not dev.hostname:
+            if not dev.hostname or dev.hostname == "[This Computer]":
+                if dev.hostname == "[This Computer]":
+                    continue
                 try:
                     socket.setdefaulttimeout(0.3)
                     dev.hostname = socket.gethostbyaddr(dev.ip)[0]
