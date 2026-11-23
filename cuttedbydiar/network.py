@@ -52,7 +52,21 @@ def _local_iface() -> tuple[str, str]:
 
 
 def _iface_network(iface_name: str) -> ipaddress.IPv4Network:
-    """Return the /24 subnet where the host resides."""
+    """Dynamically detect subnet mask/CIDR of the interface (supports /24, /21, /16, etc.)."""
+    try:
+        import re
+        if IS_WINDOWS:
+            # On Windows, fallback or parse ipconfig
+            pass
+        else:
+            out = subprocess.check_output(["ip", "addr", "show", iface_name], text=True)
+            m = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+/\d+)', out)
+            if m:
+                return ipaddress.IPv4Network(m.group(1), strict=False)
+    except Exception:
+        pass
+
+    # fallback via scapy interface ip
     from scapy.all import conf
     try:
         iface = conf.ifaces.dev_from_name(iface_name)
@@ -292,6 +306,9 @@ class BlockEngine:
     def _log(self, msg: str) -> None:
         if self.on_event:
             self.on_event(msg)
+
+    def _ensure_runtime(self) -> None:
+        pass
 
     def _ensure_running(self) -> None:
         if self._thread and self._thread.is_alive():
